@@ -8,8 +8,7 @@ import requests
 TUNETANK_MCP_URL = "https://mcp.tunetank.com"
 
 
-def search_music(duration: int = 55, mood: str = "calm") -> str:
-    """Ищет трек через MCP-сервер Tunetank."""
+def search_music(duration=55, mood="calm"):
     payload = {
         "jsonrpc": "2.0",
         "method": "tools/call",
@@ -34,17 +33,14 @@ def search_music(duration: int = 55, mood: str = "calm") -> str:
     return preview_url
 
 
-def download_music(preview_url: str, output_path: str) -> str:
-    """Скачивает превью трека."""
+def download_music(preview_url, output_path):
     data = requests.get(preview_url, timeout=60).content
     with open(output_path, "wb") as f:
         f.write(data)
     return output_path
 
 
-def mix_audio_with_video(video_path: str, music_path: str,
-                         output_path: str) -> str:
-    """Накладывает музыку на видео через локальный FFmpeg."""
+def mix_audio_with_video(video_path, music_path, output_path):
     cmd = [
         "ffmpeg", "-y",
         "-i", video_path,
