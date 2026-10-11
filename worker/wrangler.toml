@@ -1,0 +1,6 @@
+name = "yt-shorts-orchestrator"
+main = "src/index.js"
+compatibility_date = "2026-10-11"
+
+[triggers]
+crons = ["0 8 * * *", "0 14 * * *", "0 20 * * *"]
