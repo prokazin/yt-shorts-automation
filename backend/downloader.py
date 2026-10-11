@@ -6,9 +6,7 @@ import tempfile
 from internetarchive import search_items, download
 
 
-def search_and_download(query: str = "atmospheric nature",
-                        max_items: int = 1) -> str:
-    """Ищет видео на archive.org и скачивает первый MP4-файл."""
+def search_and_download(query="atmospheric nature", max_items=1):
     search = search_items(f'{query} AND mediatype:movies')
     for result in search:
         identifier = result["identifier"]
