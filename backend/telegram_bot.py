@@ -1,5 +1,5 @@
 """
-Отправка видео на одобрение в Telegram + обработка callback.
+Отправка видео на одобрение в Telegram.
 """
 import os
 import json
@@ -9,12 +9,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
-def send_video_for_approval(video_path: str, caption: str = "",
-                            video_db_id: str = "") -> int:
-    """
-    Отправляет видео в Telegram с кнопками.
-    Возвращает message_id для последующей обработки.
-    """
+def send_video_for_approval(video_path, caption="", video_db_id=""):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
     keyboard = {
         "inline_keyboard": [[
@@ -39,8 +34,7 @@ def send_video_for_approval(video_path: str, caption: str = "",
     raise RuntimeError(f"Telegram ошибка: {response.text}")
 
 
-def answer_callback(callback_id: str, text: str = "Принято!") -> None:
-    """Подтверждает нажатие кнопки в Telegram."""
+def answer_callback(callback_id, text="Принято!"):
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
         json={"callback_query_id": callback_id, "text": text},
@@ -48,8 +42,7 @@ def answer_callback(callback_id: str, text: str = "Принято!") -> None:
     )
 
 
-def send_status_message(text: str) -> None:
-    """Отправляет текстовое уведомление в Telegram."""
+def send_status_message(text):
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
         json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
@@ -57,11 +50,7 @@ def send_status_message(text: str) -> None:
     )
 
 
-def parse_callback_data(data: str) -> tuple:
-    """
-    Парсит callback_data вида "approve:uuid" или "reject:uuid".
-    Возвращает (action, video_db_id).
-    """
+def parse_callback_data(data):
     parts = data.split(":", 1)
     if len(parts) == 2:
         return parts[0], parts[1]
