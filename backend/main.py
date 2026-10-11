@@ -1,64 +1,103 @@
 """
-FastAPI — точка входа для Cloudflare Worker и Telegram webhook.
-Полный пайплайн: скачивание → монтаж → музыка → одобрение → публикация.
+Главный скрипт пайплайна. Запускается через cron.
+Полный цикл: скачивание → обработка → музыка → Telegram → одобрение → публикация.
 """
 import os
+import sys
 import tempfile
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
-from apscheduler.schedulers.background import BackgroundScheduler
 
 from downloader import search_and_download
 from processor import process_video
 from music import search_music, download_music, mix_audio_with_video
-from publisher import upload_video
+from publisher_youtube import upload_video as upload_youtube
+from publisher_instagram import upload_reel as upload_instagram
 from analytics import analyze_best_times, get_optimal_publish_time
 from storage import (
-    save_pending_video,
-    update_telegram_message_id,
-    approve_video,
-    reject_video,
-    mark_published,
-    get_approved_videos,
-    get_pending_video_by_message_id,
-    cleanup_old_videos,
+    save_pending_video, update_video, get_video,
+    get_approved_videos, cleanup_old_videos,
 )
-from telegram_bot import (
-    send_video_for_approval,
-    answer_callback,
-    send_status_message,
-    parse_callback_data,
-)
-
-app = FastAPI(title="YT Shorts Automation")
-
-scheduler = BackgroundScheduler()
+from telegram_bot import send_video_for_approval, send_status_message
 
 
-# ─── Модели ───────────────────────────────────────────────
+PIPELINE_CONFIGS = [
+    {
+        "query": "atmospheric nature",
+        "mood": "calm",
+        "title": "Атмосферная нарезка",
+        "description": "Успокаивающее видео с природой #shorts #atmospheric",
+        "tags": ["atmospheric", "nature", "relax", "shorts"],
+        "platforms": ["youtube", "instagram"],
+    },
+    {
+        "query": "vintage city 1950s",
+        "mood": "nostalgic",
+        "title": "Ретро-город",
+        "description": "Винтажные кадры города #shorts #retro #vintage",
+        "tags": ["retro", "vintage", "city", "shorts"],
+        "platforms": ["youtube", "instagram"],
+    },
+    {
+        "query": "ocean waves sunset",
+        "mood": "peaceful",
+        "title": "Океан на закате",
+        "description": "Волны и закат #shorts #ocean #sunset",
+        "tags": ["ocean", "sunset", "waves", "shorts"],
+        "platforms": ["youtube", "instagram"],
+    },
+]
 
-class PipelineRequest(BaseModel):
-    query: str = "atmospheric nature"
-    mood: str = "calm"
-    title: str = "Atmospheric Short"
-    description: str = ""
-    tags: list = []
+
+def run_pipeline(config_index=0):
+    cfg = PIPELINE_CONFIGS[config_index % len(PIPELINE_CONFIGS)]
+    print(f"[pipeline] Запуск: {cfg['title']}")
+
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix="pipeline_")
+
+        raw_video = search_and_download(query=cfg["query"])
+
+        processed = os.path.join(tmp_dir, "processed.mp4")
+        process_video(raw_video, processed, duration=55)
+
+        music_url = search_music(duration=55, mood=cfg["mood"])
+        music_path = os.path.join(tmp_dir, "music.mp3")
+        download_music(music_url, music_path)
+
+        final_video = os.path.join(tmp_dir, "final.mp4")
+        mix_audio_with_video(processed, music_path, final_video)
+
+        db_record = save_pending_video(
+            video_path=final_video,
+            title=cfg["title"],
+            description=cfg["description"],
+            tags=cfg["tags"],
+            query=cfg["query"],
+            mood=cfg["mood"],
+            platforms=cfg["platforms"],
+        )
+        video_db_id = db_record["id"]
+
+        send_video_for_approval(
+            final_video,
+            caption=f"🎬 {cfg['title']}\n\n{cfg['description']}",
+            video_db_id=video_db_id,
+        )
+
+        print(f"[pipeline] Видео отправлено на одобрение: {video_db_id}")
+        return video_db_id
+
+    except Exception as e:
+        error_msg = f"❌ Ошибка пайплайна: {e}"
+        print(error_msg)
+        send_status_message(error_msg)
+        raise
 
 
-class PublishRequest(BaseModel):
-    video_db_id: str
-
-
-# ─── Планировщик ──────────────────────────────────────────
-
-def scheduled_publish_job():
-    """
-    Каждые 30 минут проверяет одобренные видео
-    и публикует те, для которых наступило оптимальное время.
-    """
+def publish_approved():
     approved = get_approved_videos()
     if not approved:
+        print("[publish] Нет одобренных видео")
         return
 
     now = datetime.now(timezone.utc)
@@ -69,171 +108,137 @@ def scheduled_publish_job():
             continue
         try:
             scheduled_dt = datetime.fromisoformat(scheduled)
-            if scheduled_dt <= now:
-                _publish_single_video(video)
+            if scheduled_dt > now:
+                continue
         except (ValueError, TypeError):
             continue
 
+        _publish_single_video(video)
 
-def _publish_single_video(video: dict) -> None:
-    """Публикует одно видео на YouTube и обновляет статус."""
+
+def _publish_single_video(video):
+    results = []
+    platforms = video.get("platforms", ["youtube"])
+
     try:
-        youtube_id = upload_video(
-            video_path=video["video_path"],
-            title=video["title"],
-            description=video.get("description", ""),
-            tags=video.get("tags", []),
-            publish_at=video.get("scheduled_publish_time"),
+        if "youtube" in platforms:
+            yt_id = upload_youtube(
+                video_path=video["video_path"],
+                title=video["title"],
+                description=video.get("description", ""),
+                tags=video.get("tags", []),
+                publish_at=video.get("scheduled_publish_time"),
+            )
+            update_video(video["id"], youtube_video_id=yt_id)
+            results.append(f"YouTube: https://youtu.be/{yt_id}")
+
+        if "instagram" in platforms:
+            ig_id = upload_instagram(
+                video_path=video["video_path"],
+                caption=video.get("description", ""),
+            )
+            update_video(video["id"], instagram_media_id=ig_id)
+            results.append(f"Instagram: {ig_id}")
+
+        update_video(
+            video["id"],
+            status="published",
+            published_at=datetime.now(timezone.utc).isoformat(),
         )
-        mark_published(video["id"], youtube_id)
         send_status_message(
-            f"✅ Опубликовано: {video['title']}\n"
-            f"https://youtu.be/{youtube_id}"
+            f"✅ Опубликовано: {video['title']}\n" + "\n".join(results)
         )
+
     except Exception as e:
-        send_status_message(
-            f"❌ Ошибка публикации «{video['title']}»: {e}"
-        )
+        send_status_message(f"❌ Ошибка публикации «{video['title']}»: {e}")
 
 
-# ─── Запуск планировщика ──────────────────────────────────
-
-@app.on_event("startup")
-def startup_event():
-    scheduler.add_job(scheduled_publish_job, "interval", minutes=30)
-    scheduler.add_job(analyze_best_times, "cron", hour=3, minute=0)
-    scheduler.add_job(cleanup_old_videos, "cron", hour=4, minute=0)
-    scheduler.start()
-    print("[startup] Планировщик запущен")
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    scheduler.shutdown()
-
-
-# ─── Эндпоинты ────────────────────────────────────────────
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
-
-
-@app.post("/run-pipeline")
-def run_pipeline(req: PipelineRequest):
-    """
-    Полный пайплайн: скачать → обработать → музыка → отправить на одобрение.
-    """
+def run_analytics():
     try:
-        tmp_dir = tempfile.mkdtemp(prefix="pipeline_")
-
-        # 1. Скачивание
-        raw_video = search_and_download(query=req.query)
-
-        # 2. Обработка (вертикальный формат)
-        processed = os.path.join(tmp_dir, "processed.mp4")
-        process_video(raw_video, processed, duration=55)
-
-        # 3. Подбор и наложение музыки
-        music_url = search_music(duration=55, mood=req.mood)
-        music_path = os.path.join(tmp_dir, "music.mp3")
-        download_music(music_url, music_path)
-
-        final_video = os.path.join(tmp_dir, "final.mp4")
-        mix_audio_with_video(processed, music_path, final_video)
-
-        # 4. Сохранение в Supabase
-        db_record = save_pending_video(
-            video_path=final_video,
-            title=req.title,
-            description=req.description,
-            tags=req.tags,
-            query=req.query,
-            mood=req.mood,
-        )
-        video_db_id = db_record.get("id", "")
-
-        # 5. Отправка в Telegram
-        message_id = send_video_for_approval(
-            final_video,
-            caption=f"🎬 {req.title}\n\n{req.description}",
-            video_db_id=video_db_id,
-        )
-        update_telegram_message_id(video_db_id, message_id)
-
-        return {
-            "status": "sent_for_approval",
-            "video_db_id": video_db_id,
-            "message_id": message_id,
-        }
+        analyze_best_times()
+        send_status_message("📊 Анализ времени публикации завершён")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        send_status_message(f"❌ Ошибка анализа: {e}")
 
 
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
-    """
-    Обрабатывает callback от кнопок «Одобрить» / «Отклонить».
-    """
-    data = await request.json()
+def handle_telegram_commands():
+    import requests
+    from telegram_bot import TELEGRAM_BOT_TOKEN
 
-    if "callback_query" not in data:
-        return {"ok": True}
+    state_file = os.path.join(os.path.dirname(__file__), "telegram_offset.txt")
+    offset = 0
+    if os.path.exists(state_file):
+        with open(state_file, "r") as f:
+            offset = int(f.read().strip() or "0")
 
-    callback = data["callback_query"]
-    callback_id = callback.get("id", "")
-    callback_data = callback.get("data", "")
+    resp = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+        params={"offset": offset, "timeout": 5},
+        timeout=30,
+    )
+    if not resp.ok:
+        return
 
-    action, video_db_id = parse_callback_data(callback_data)
+    updates = resp.json().get("result", [])
+    for update in updates:
+        offset = update["update_id"] + 1
 
-    if not video_db_id:
-        answer_callback(callback_id, "Ошибка: видео не найдено")
-        return {"ok": True}
+        if "callback_query" in update:
+            callback = update["callback_query"]
+            callback_id = callback.get("id", "")
+            callback_data = callback.get("data", "")
 
-    if action == "approve":
-        approve_video(video_db_id)
+            from telegram_bot import parse_callback_data, answer_callback
+            action, video_db_id = parse_callback_data(callback_data)
 
-        # Определяем оптимальное время публикации
-        publish_time = get_optimal_publish_time()
+            if not video_db_id:
+                answer_callback(callback_id, "Ошибка: видео не найдено")
+                continue
 
-        # Обновляем запись с временем публикации
-        from storage import supabase
-        supabase.table("pending_videos").update({
-            "scheduled_publish_time": publish_time,
-        }).eq("id", video_db_id).execute()
+            if action == "approve":
+                video = get_video(video_db_id)
+                if not video:
+                    answer_callback(callback_id, "Видео не найдено")
+                    continue
 
-        answer_callback(callback_id, f"✅ Одобрено! Публикация: {publish_time}")
-        send_status_message(
-            f"✅ Видео одобрено.\n"
-            f"Оптимальное время публикации: {publish_time}"
-        )
+                publish_time = get_optimal_publish_time()
+                update_video(
+                    video_db_id,
+                    status="approved",
+                    approved_at=datetime.now(timezone.utc).isoformat(),
+                    scheduled_publish_time=publish_time,
+                )
+                answer_callback(callback_id, f"✅ Одобрено! Публикация: {publish_time}")
+                send_status_message(
+                    f"✅ Видео одобрено.\n"
+                    f"Оптимальное время публикации: {publish_time}"
+                )
 
-    elif action == "reject":
-        reject_video(video_db_id)
-        answer_callback(callback_id, "❌ Отклонено")
-        send_status_message("❌ Видео отклонено.")
+            elif action == "reject":
+                update_video(video_db_id, status="rejected")
+                answer_callback(callback_id, "❌ Отклонено")
+                send_status_message("❌ Видео отклонено.")
 
-    return {"ok": True}
-
-
-@app.post("/approve-and-publish")
-def approve_and_publish(video_db_id: str):
-    """Принудительная публикация одобренного видео (без ожидания расписания)."""
-    approved = get_approved_videos()
-    video = next((v for v in approved if v["id"] == video_db_id), None)
-    if not video:
-        raise HTTPException(status_code=404, detail="Видео не найдено")
-    _publish_single_video(video)
-    return {"status": "published"}
-
-
-@app.post("/analyze-times")
-def trigger_analyze():
-    """Ручной запуск анализа лучшего времени публикации."""
-    results = analyze_best_times()
-    return {"status": "ok", "results": results[:10]}
+    with open(state_file, "w") as f:
+        f.write(str(offset))
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    action = sys.argv[1] if len(sys.argv) > 1 else "pipeline"
+
+    if action == "pipeline":
+        config_index = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+        run_pipeline(config_index)
+
+    elif action == "publish":
+        publish_approved()
+
+    elif action == "analytics":
+        run_analytics()
+
+    elif action == "telegram":
+        handle_telegram_commands()
+
+    elif action == "cleanup":
+        cleanup_old_videos()
+        print("[cleanup] Старые видео удалены")
